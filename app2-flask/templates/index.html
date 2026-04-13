@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>SRE Demo — Inventory Management</title>
+    <link rel="shortcut icon" href="{{ url_for('static', filename='favicon.ico') }}">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+    <style>
+        :root {
+            --sre-primary: #0d6efd;
+            --sre-dark: #1a1d23;
+            --sre-surface: #212529;
+            --sre-border: #2c3034;
+            --sre-muted: #6c757d;
+        }
+        body { background: #f4f6f9; font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; }
+
+        .navbar-sre {
+            background: linear-gradient(135deg, var(--sre-dark) 0%, #2c3e50 100%);
+            box-shadow: 0 2px 8px rgba(0,0,0,.15);
+        }
+        .navbar-sre .navbar-brand { font-weight: 700; letter-spacing: .5px; }
+        .health-badge { font-size: .75rem; padding: .25em .6em; border-radius: 50rem; }
+
+        .stat-card {
+            border: none;
+            border-radius: .75rem;
+            box-shadow: 0 1px 4px rgba(0,0,0,.06);
+            transition: transform .15s, box-shadow .15s;
+        }
+        .stat-card:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,.1); }
+        .stat-card .stat-value { font-size: 1.75rem; font-weight: 700; line-height: 1.2; }
+        .stat-card .stat-label { font-size: .8rem; text-transform: uppercase; letter-spacing: .5px; color: var(--sre-muted); }
+        .stat-icon { width: 48px; height: 48px; border-radius: .5rem; display: flex; align-items: center; justify-content: center; font-size: 1.25rem; }
+
+        .table-card {
+            border: none;
+            border-radius: .75rem;
+            box-shadow: 0 1px 4px rgba(0,0,0,.06);
+            overflow: hidden;
+        }
+        .table-card .card-header {
+            background: #fff;
+            border-bottom: 2px solid #e9ecef;
+            font-weight: 600;
+        }
+        .table > thead { background: #f8f9fa; }
+        .table > thead th {
+            font-size: .78rem;
+            text-transform: uppercase;
+            letter-spacing: .4px;
+            color: var(--sre-muted);
+            border-bottom-width: 1px;
+            padding: .65rem .75rem;
+        }
+        .table > tbody td { vertical-align: middle; padding: .6rem .75rem; }
+
+        .badge-status {
+            font-size: .72rem;
+            font-weight: 600;
+            padding: .3em .65em;
+            border-radius: 50rem;
+            letter-spacing: .3px;
+            text-transform: uppercase;
+        }
+        .badge-in_stock { background: #d1fae5; color: #065f46; }
+        .badge-low_stock { background: #fef3c7; color: #92400e; }
+        .badge-out_of_stock { background: #fee2e2; color: #991b1b; }
+
+        .form-card {
+            border: none;
+            border-radius: .75rem;
+            box-shadow: 0 1px 4px rgba(0,0,0,.06);
+        }
+        .form-card .card-header {
+            background: #fff;
+            border-bottom: 2px solid #e9ecef;
+            font-weight: 600;
+        }
+
+        .btn-action { padding: .25rem .5rem; font-size: .78rem; border-radius: .35rem; }
+
+        .toast-container { z-index: 1090; }
+
+        .spinner-border-sm { width: 1rem; height: 1rem; border-width: .15em; }
+
+        @media (max-width: 767.98px) {
+            .stat-card .stat-value { font-size: 1.35rem; }
+            .table-responsive { font-size: .85rem; }
+        }
+    </style>
+</head>
+<body>
+
+<!-- Navbar -->
+<nav class="navbar navbar-sre navbar-dark py-2">
+    <div class="container">
+        <span class="navbar-brand d-flex align-items-center gap-2">
+            <i class="bi bi-box-seam fs-4"></i>
+            SRE Demo — Inventory Management
+            <span class="badge bg-info bg-opacity-25 text-info ms-2" style="font-size:.65rem;">Flask</span>
+        </span>
+        <span class="d-flex align-items-center gap-2 text-white-50" style="font-size:.85rem;">
+            <span id="healthIndicator">
+                <span class="spinner-border spinner-border-sm text-light" role="status"></span>
+            </span>
+            <span id="healthText">Checking…</span>
+        </span>
+    </div>
+</nav>
+
+<div class="container py-4">
+
+    <!-- Stats Row -->
+    <div class="row g-3 mb-4" id="statsRow">
+        <div class="col-6 col-md-3">
+            <div class="card stat-card h-100">
+                <div class="card-body d-flex align-items-center gap-3">
+                    <div class="stat-icon bg-primary bg-opacity-10 text-primary"><i class="bi bi-box-seam"></i></div>
+                    <div>
+                        <div class="stat-value" id="statTotal">—</div>
+                        <div class="stat-label">Products</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="col-6 col-md-3">
+            <div class="card stat-card h-100">
+                <div class="card-body d-flex align-items-center gap-3">
+                    <div class="stat-icon bg-success bg-opacity-10 text-success"><i class="bi bi-currency-dollar"></i></div>
+                    <div>
+                        <div class="stat-value" id="statValue">—</div>
+                        <div class="stat-label">Inventory Value</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="col-6 col-md-2">
+            <div class="card stat-card h-100">
+                <div class="card-body d-flex align-items-center gap-3">
+                    <div class="stat-icon bg-success bg-opacity-10 text-success"><i class="bi bi-check-circle"></i></div>
+                    <div>
+                        <div class="stat-value" id="statInStock">—</div>
+                        <div class="stat-label">In Stock</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="col-6 col-md-2">
+            <div class="card stat-card h-100">
+                <div class="card-body d-flex align-items-center gap-3">
+                    <div class="stat-icon bg-warning bg-opacity-10 text-warning"><i class="bi bi-exclamation-triangle"></i></div>
+                    <div>
+                        <div class="stat-value" id="statLowStock">—</div>
+                        <div class="stat-label">Low Stock</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="col-6 col-md-2">
+            <div class="card stat-card h-100">
+                <div class="card-body d-flex align-items-center gap-3">
+                    <div class="stat-icon bg-danger bg-opacity-10 text-danger"><i class="bi bi-x-circle"></i></div>
+                    <div>
+                        <div class="stat-value" id="statOutOfStock">—</div>
+                        <div class="stat-label">Out of Stock</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row g-4">
+        <!-- Product Table -->
+        <div class="col-lg-8">
+            <div class="card table-card">
+                <div class="card-header d-flex justify-content-between align-items-center py-3">
+                    <span><i class="bi bi-table me-2"></i>Product Catalog</span>
+                    <button class="btn btn-sm btn-outline-secondary" onclick="refreshAll()" title="Refresh">
+                        <i class="bi bi-arrow-clockwise"></i>
+                    </button>
+                </div>
+                <div class="card-body p-0">
+                    <div class="table-responsive">
+                        <table class="table table-hover mb-0">
+                            <thead>
+                                <tr>
+                                    <th>ID</th>
+                                    <th>Name</th>
+                                    <th>Category</th>
+                                    <th class="text-end">Price</th>
+                                    <th class="text-end">Stock</th>
+                                    <th>Status</th>
+                                    <th class="text-center">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="productTableBody">
+                                <tr>
+                                    <td colspan="7" class="text-center py-4 text-muted">
+                                        <span class="spinner-border spinner-border-sm me-2"></span>Loading products…
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Add Product Form -->
+        <div class="col-lg-4">
+            <div class="card form-card">
+                <div class="card-header py-3">
+                    <i class="bi bi-plus-circle me-2"></i>Add New Product
+                </div>
+                <div class="card-body">
+                    <form id="addProductForm" onsubmit="return handleAddProduct(event)">
+                        <div class="mb-3">
+                            <label for="prodName" class="form-label fw-semibold">Product Name</label>
+                            <input type="text" class="form-control" id="prodName" required placeholder="e.g. Load Balancer">
+                        </div>
+                        <div class="mb-3">
+                            <label for="prodCategory" class="form-label fw-semibold">Category</label>
+                            <select class="form-select" id="prodCategory">
+                                <option>Infrastructure</option>
+                                <option>Security</option>
+                                <option>Database</option>
+                                <option>Networking</option>
+                                <option>Compute</option>
+                                <option>Storage</option>
+                                <option>Monitoring</option>
+                                <option>General</option>
+                            </select>
+                        </div>
+                        <div class="row g-2 mb-3">
+                            <div class="col-6">
+                                <label for="prodPrice" class="form-label fw-semibold">Price ($)</label>
+                                <input type="number" step="0.01" min="0" class="form-control" id="prodPrice" required placeholder="0.00">
+                            </div>
+                            <div class="col-6">
+                                <label for="prodStock" class="form-label fw-semibold">Stock</label>
+                                <input type="number" min="0" class="form-control" id="prodStock" required placeholder="0">
+                            </div>
+                        </div>
+                        <button type="submit" class="btn btn-primary w-100" id="addBtn">
+                            <i class="bi bi-plus-lg me-1"></i>Add Product
+                        </button>
+                    </form>
+                </div>
+            </div>
+
+            <!-- Quick Info -->
+            <div class="card form-card mt-3">
+                <div class="card-body text-muted" style="font-size:.82rem;">
+                    <p class="mb-2"><i class="bi bi-info-circle me-1"></i><strong>About this demo</strong></p>
+                    <p class="mb-1">Purchases have a ~30% simulated failure rate (payment gateway timeout / inventory sync errors) for SRE observability testing.</p>
+                    <p class="mb-0">Data is stored in Azure PostgreSQL.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Toast container -->
+<div class="toast-container position-fixed bottom-0 end-0 p-3" id="toastContainer"></div>
+
+<!-- Delete Confirmation Modal -->
+<div class="modal fade" id="deleteModal" tabindex="-1">
+    <div class="modal-dialog modal-sm modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header border-0 pb-0">
+                <h6 class="modal-title">Confirm Delete</h6>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body pt-2">
+                <p class="mb-0 text-muted">Delete <strong id="deleteProductName"></strong>? This cannot be undone.</p>
+            </div>
+            <div class="modal-footer border-0 pt-0">
+                <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-sm btn-danger" id="confirmDeleteBtn">Delete</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+(function () {
+    'use strict';
+
+    // ── Helpers ──────────────────────────────────────────
+    function $(sel) { return document.querySelector(sel); }
+    function $$(sel) { return document.querySelectorAll(sel); }
+
+    function formatCurrency(n) {
+        return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(n);
+    }
+
+    function statusBadge(status) {
+        const labels = { in_stock: 'In Stock', low_stock: 'Low Stock', out_of_stock: 'Out of Stock' };
+        return `<span class="badge badge-status badge-${status}">${labels[status] || status}</span>`;
+    }
+
+    function showToast(message, type) {
+        const icons = { success: 'check-circle-fill', danger: 'exclamation-triangle-fill', warning: 'exclamation-circle-fill', info: 'info-circle-fill' };
+        const id = 'toast-' + Date.now();
+        const html = `
+            <div id="${id}" class="toast align-items-center text-bg-${type} border-0" role="alert">
+                <div class="d-flex">
+                    <div class="toast-body"><i class="bi bi-${icons[type] || 'info-circle-fill'} me-2"></i>${message}</div>
+                    <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button>
+                </div>
+            </div>`;
+        $('#toastContainer').insertAdjacentHTML('beforeend', html);
+        const el = document.getElementById(id);
+        const toast = new bootstrap.Toast(el, { delay: 4000 });
+        toast.show();
+        el.addEventListener('hidden.bs.toast', () => el.remove());
+    }
+
+    // ── API calls ────────────────────────────────────────
+    async function apiGet(url) {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
+        return res.json();
+    }
+
+    async function apiPost(url, body) {
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || data.message || res.statusText);
+        return data;
+    }
+
+    async function apiDelete(url) {
+        const res = await fetch(url, { method: 'DELETE' });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || res.statusText);
+        return data;
+    }
+
+    // ── Health ───────────────────────────────────────────
+    async function checkHealth() {
+        try {
+            const h = await apiGet('/api/health');
+            const ok = h.database === 'connected';
+            $('#healthIndicator').innerHTML = ok
+                ? '<i class="bi bi-circle-fill text-success" style="font-size:.55rem;"></i>'
+                : '<i class="bi bi-circle-fill text-danger" style="font-size:.55rem;"></i>';
+            $('#healthText').textContent = ok ? 'DB Connected' : 'DB Error';
+            $('#healthText').className = ok ? 'text-success-subtle' : 'text-danger-subtle';
+        } catch {
+            $('#healthIndicator').innerHTML = '<i class="bi bi-circle-fill text-danger" style="font-size:.55rem;"></i>';
+            $('#healthText').textContent = 'Unreachable';
+            $('#healthText').className = 'text-danger-subtle';
+        }
+    }
+
+    // ── Stats ────────────────────────────────────────────
+    async function loadStats() {
+        try {
+            const s = await apiGet('/api/products/stats');
+            $('#statTotal').textContent = s.total_products;
+            $('#statValue').textContent = formatCurrency(s.total_inventory_value);
+            const byStatus = {};
+            (s.by_status || []).forEach(b => { byStatus[b.status] = b.count; });
+            $('#statInStock').textContent = byStatus['in_stock'] || 0;
+            $('#statLowStock').textContent = byStatus['low_stock'] || 0;
+            $('#statOutOfStock').textContent = byStatus['out_of_stock'] || 0;
+        } catch {
+            $$('.stat-value').forEach(el => { el.textContent = '!'; });
+        }
+    }
+
+    // ── Products table ───────────────────────────────────
+    async function loadProducts() {
+        const tbody = $('#productTableBody');
+        try {
+            const products = await apiGet('/api/products');
+            if (products.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4 text-muted">No products found. Add one using the form.</td></tr>';
+                return;
+            }
+            tbody.innerHTML = products.map(p => `
+                <tr>
+                    <td class="text-muted">#${p.id}</td>
+                    <td class="fw-semibold">${escapeHtml(p.name)}</td>
+                    <td><span class="text-muted">${escapeHtml(p.category)}</span></td>
+                    <td class="text-end">${formatCurrency(p.price)}</td>
+                    <td class="text-end">${p.stock}</td>
+                    <td>${statusBadge(p.status)}</td>
+                    <td class="text-center">
+                        <button class="btn btn-outline-success btn-action me-1" onclick="handlePurchase(${p.id}, '${escapeAttr(p.name)}')"
+                                title="Purchase 1 unit" ${p.stock === 0 ? 'disabled' : ''}>
+                            <i class="bi bi-cart-plus"></i>
+                        </button>
+                        <button class="btn btn-outline-danger btn-action" onclick="confirmDelete(${p.id}, '${escapeAttr(p.name)}')"
+                                title="Delete product">
+                            <i class="bi bi-trash3"></i>
+                        </button>
+                    </td>
+                </tr>`).join('');
+        } catch (err) {
+            tbody.innerHTML = `<tr><td colspan="7" class="text-center py-4 text-danger"><i class="bi bi-exclamation-triangle me-2"></i>Failed to load products: ${escapeHtml(err.message)}</td></tr>`;
+        }
+    }
+
+    function escapeHtml(str) {
+        const d = document.createElement('div');
+        d.textContent = str;
+        return d.innerHTML;
+    }
+
+    function escapeAttr(str) {
+        return str.replace(/'/g, "\\'").replace(/"/g, '\\"');
+    }
+
+    // ── Actions ──────────────────────────────────────────
+    window.handlePurchase = async function (id, name) {
+        try {
+            await apiPost(`/api/products/${id}/purchase`, { quantity: 1 });
+            showToast(`Purchased 1 × ${name}`, 'success');
+            refreshAll();
+        } catch (err) {
+            showToast(`Purchase failed: ${err.message}`, 'danger');
+        }
+    };
+
+    let pendingDeleteId = null;
+    window.confirmDelete = function (id, name) {
+        pendingDeleteId = id;
+        $('#deleteProductName').textContent = name;
+        new bootstrap.Modal($('#deleteModal')).show();
+    };
+
+    $('#confirmDeleteBtn').addEventListener('click', async () => {
+        if (!pendingDeleteId) return;
+        const id = pendingDeleteId;
+        bootstrap.Modal.getInstance($('#deleteModal')).hide();
+        try {
+            await apiDelete(`/api/products/${id}`);
+            showToast('Product deleted.', 'success');
+            refreshAll();
+        } catch (err) {
+            showToast(`Delete failed: ${err.message}`, 'danger');
+        }
+    });
+
+    window.handleAddProduct = async function (e) {
+        e.preventDefault();
+        const btn = $('#addBtn');
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Adding…';
+        try {
+            const body = {
+                name: $('#prodName').value.trim(),
+                category: $('#prodCategory').value,
+                price: parseFloat($('#prodPrice').value),
+                stock: parseInt($('#prodStock').value, 10)
+            };
+            if (!body.name) throw new Error('Name is required');
+            await apiPost('/api/products', body);
+            showToast(`Added "${body.name}"`, 'success');
+            $('#addProductForm').reset();
+            refreshAll();
+        } catch (err) {
+            showToast(`Add failed: ${err.message}`, 'danger');
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = '<i class="bi bi-plus-lg me-1"></i>Add Product';
+        }
+    };
+
+    // ── Refresh ──────────────────────────────────────────
+    window.refreshAll = function () {
+        loadProducts();
+        loadStats();
+    };
+
+    // ── Init ─────────────────────────────────────────────
+    checkHealth();
+    loadProducts();
+    loadStats();
+    setInterval(checkHealth, 30000);
+})();
+</script>
+</body>
+</html>

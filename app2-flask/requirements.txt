@@ -1,0 +1,7 @@
+Flask==3.1.0
+gunicorn
+azure-monitor-opentelemetry
+opentelemetry-instrumentation-flask
+opentelemetry-api
+flask-sqlalchemy
+psycopg2-binary
