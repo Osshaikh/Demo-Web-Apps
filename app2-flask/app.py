@@ -309,7 +309,7 @@ def purchase_product(product_id):
                              "transaction_value": round(product.price * qty, 2)
                          }})
             return jsonify({
-                "error": "Payment gateway timeout \u2014 please retry",
+                "error": "Payment gateway timeout — please retry",
                 "type": "PaymentTimeout",
                 "product_id": product_id,
                 "retry_after_seconds": 5
@@ -326,7 +326,7 @@ def purchase_product(product_id):
                              "category": product.category, "failure_reason": "stale_cache"
                          }})
             return jsonify({
-                "error": "Inventory sync temporarily unavailable \u2014 please retry",
+                "error": "Inventory sync temporarily unavailable — please retry",
                 "type": "InventorySyncError",
                 "product_id": product_id,
                 "retry_after_seconds": 2
