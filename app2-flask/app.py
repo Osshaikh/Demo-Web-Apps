@@ -293,8 +293,8 @@ def purchase_product(product_id):
         # 4. CUSTOM METRIC — count every purchase attempt with dimensional attributes
         purchase_counter.add(1, {"status": "attempted", "category": product.category})
 
-        roll = random.randint(1, 10)
-        if roll <= 2:
+        roll = random.randint(1, 100)
+        if roll <= 2:  # 2% chance (was 20% with randint(1,10) <= 2)
             span.set_attribute("purchase.result", "payment_timeout")
             span.set_status(trace.StatusCode.ERROR, "Payment gateway timeout")
             purchase_counter.add(1, {"status": "failed", "reason": "timeout", "category": product.category})
@@ -308,9 +308,14 @@ def purchase_product(product_id):
                              "failure_reason": "payment_gateway_timeout",
                              "transaction_value": round(product.price * qty, 2)
                          }})
-            raise TimeoutError(f"Payment gateway timeout for product {product_id}")
+            return jsonify({
+                "error": "Payment gateway timeout — please retry",
+                "type": "PaymentTimeout",
+                "product_id": product_id,
+                "retry_after_seconds": 5
+            }), 504
 
-        if roll == 3:
+        if roll == 3:  # 1% chance (was 10% with randint(1,10) == 3)
             span.set_attribute("purchase.result", "inventory_sync_error")
             span.set_status(trace.StatusCode.ERROR, "Inventory sync failed")
             purchase_counter.add(1, {"status": "failed", "reason": "sync_error", "category": product.category})
@@ -320,7 +325,12 @@ def purchase_product(product_id):
                              "product_id": product_id, "product_name": product.name,
                              "category": product.category, "failure_reason": "stale_cache"
                          }})
-            raise RuntimeError(f"Inventory sync failed — stale cache for product {product_id}")
+            return jsonify({
+                "error": "Inventory sync temporarily unavailable — please retry",
+                "type": "InventorySyncError",
+                "product_id": product_id,
+                "retry_after_seconds": 2
+            }), 503
 
         if product.stock < qty:
             span.set_attribute("purchase.result", "insufficient_stock")
@@ -410,10 +420,35 @@ def whoami():
 
 
 # ========== SRE CHAOS ENDPOINTS ==========
+# Guard: set ENABLE_CHAOS_ENDPOINTS=true to allow chaos/stress testing.
+# Disabled by default to prevent accidental alert noise in production.
+CHAOS_ENABLED = os.environ.get("ENABLE_CHAOS_ENDPOINTS", "false").lower() == "true"
+_chaos_cooldown = {}  # simple per-endpoint cooldown tracker
+CHAOS_COOLDOWN_SECONDS = 60  # minimum seconds between chaos invocations
+
+
+def _check_chaos_allowed(endpoint_name):
+    """Return (allowed: bool, reason: str|None). Enforces feature flag + cooldown."""
+    if not CHAOS_ENABLED:
+        return False, "Chaos endpoints are disabled. Set ENABLE_CHAOS_ENDPOINTS=true to enable."
+    last_call = _chaos_cooldown.get(endpoint_name, 0)
+    elapsed = time.time() - last_call
+    if elapsed < CHAOS_COOLDOWN_SECONDS:
+        remaining = int(CHAOS_COOLDOWN_SECONDS - elapsed)
+        return False, f"Rate limited. Retry after {remaining}s."
+    _chaos_cooldown[endpoint_name] = time.time()
+    return True, None
+
+
 @app.route('/api/stress/cpu')
 def stress_cpu():
+    allowed, reason = _check_chaos_allowed("stress_cpu")
+    if not allowed:
+        logger.info('CPU stress test blocked: %s', reason)
+        return jsonify({"error": reason, "endpoint": "/api/stress/cpu"}), 403
+
     seconds = min(int(request.args.get('seconds', 10)), 30)
-    logger.warning('CPU stress test for %ds', seconds)
+    logger.warning('CPU stress test for %ds (chaos enabled)', seconds)
     end = time.time() + seconds
     while time.time() < end:
         _ = sum(i * i for i in range(1000))
@@ -422,6 +457,11 @@ def stress_cpu():
 
 @app.route('/api/simulate/incident')
 def simulate_incident():
+    allowed, reason = _check_chaos_allowed("simulate_incident")
+    if not allowed:
+        logger.info('Incident simulation blocked: %s', reason)
+        return jsonify({"error": reason, "endpoint": "/api/simulate/incident"}), 403
+
     logger.critical('INCIDENT SIMULATION: generating error burst with DB pressure')
     errors = []
     for i in range(20):
