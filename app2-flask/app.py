@@ -3,6 +3,7 @@ import time
 import random
 import logging
 import uuid
+import threading
 
 from flask import Flask, redirect, render_template, request, send_from_directory, url_for, jsonify, session
 from azure.monitor.opentelemetry import configure_azure_monitor
@@ -61,6 +62,12 @@ api_latency_histogram = meter.create_histogram(
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "sre-demo-secret-key-2024")
+
+# ========== CHAOS ENDPOINT CONFIGURATION ==========
+ENABLE_CHAOS_ENDPOINTS = os.environ.get("ENABLE_CHAOS_ENDPOINTS", "false").lower() == "true"
+CHAOS_COOLDOWN_SECONDS = 60
+_chaos_last_called: dict = {}  # endpoint -> last invocation timestamp
+_chaos_lock = threading.Lock()  # protects _chaos_last_called in multi-threaded deployments
 
 # Explicitly instrument this Flask app instance for request telemetry
 from opentelemetry.instrumentation.flask import FlaskInstrumentor
@@ -293,8 +300,8 @@ def purchase_product(product_id):
         # 4. CUSTOM METRIC — count every purchase attempt with dimensional attributes
         purchase_counter.add(1, {"status": "attempted", "category": product.category})
 
-        roll = random.randint(1, 10)
-        if roll <= 2:
+        roll = random.randint(1, 100)
+        if roll <= 2:  # 2% payment timeout rate (reduced from 20%)
             span.set_attribute("purchase.result", "payment_timeout")
             span.set_status(trace.StatusCode.ERROR, "Payment gateway timeout")
             purchase_counter.add(1, {"status": "failed", "reason": "timeout", "category": product.category})
@@ -310,7 +317,7 @@ def purchase_product(product_id):
                          }})
             raise TimeoutError(f"Payment gateway timeout for product {product_id}")
 
-        if roll == 3:
+        if roll == 3:  # 1% inventory sync error rate (reduced from 10%)
             span.set_attribute("purchase.result", "inventory_sync_error")
             span.set_status(trace.StatusCode.ERROR, "Inventory sync failed")
             purchase_counter.add(1, {"status": "failed", "reason": "sync_error", "category": product.category})
@@ -410,8 +417,25 @@ def whoami():
 
 
 # ========== SRE CHAOS ENDPOINTS ==========
+def _check_chaos_allowed(endpoint_name: str):
+    """Return a 403 response if chaos is disabled or the cooldown has not elapsed."""
+    if not ENABLE_CHAOS_ENDPOINTS:
+        return jsonify({"error": "Chaos endpoints are disabled", "hint": "Set ENABLE_CHAOS_ENDPOINTS=true to enable"}), 403
+    now = time.time()
+    with _chaos_lock:
+        last = _chaos_last_called.get(endpoint_name, 0)
+        if now - last < CHAOS_COOLDOWN_SECONDS:
+            remaining = int(CHAOS_COOLDOWN_SECONDS - (now - last))
+            return jsonify({"error": "Cooldown active", "retry_after_seconds": remaining}), 429
+        _chaos_last_called[endpoint_name] = now
+    return None
+
+
 @app.route('/api/stress/cpu')
 def stress_cpu():
+    guard = _check_chaos_allowed("stress_cpu")
+    if guard is not None:
+        return guard
     seconds = min(int(request.args.get('seconds', 10)), 30)
     logger.warning('CPU stress test for %ds', seconds)
     end = time.time() + seconds
@@ -422,6 +446,9 @@ def stress_cpu():
 
 @app.route('/api/simulate/incident')
 def simulate_incident():
+    guard = _check_chaos_allowed("simulate_incident")
+    if guard is not None:
+        return guard
     logger.critical('INCIDENT SIMULATION: generating error burst with DB pressure')
     errors = []
     for i in range(20):
