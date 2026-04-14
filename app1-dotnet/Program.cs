@@ -173,8 +173,16 @@ app.MapGet("/api/external", async (IHttpClientFactory httpFactory) =>
 });
 
 // ========== SRE CHAOS ENDPOINTS ==========
+bool IsChaosEnabled() =>
+    string.Equals(Environment.GetEnvironmentVariable("ENABLE_CHAOS_ENDPOINTS"), "true", StringComparison.OrdinalIgnoreCase);
+
 app.MapGet("/api/stress/cpu", (int? seconds) =>
 {
+    if (!IsChaosEnabled())
+    {
+        logger.LogInformation("CPU stress test blocked: ENABLE_CHAOS_ENDPOINTS is not true");
+        return Results.Json(new { error = "Chaos endpoints are disabled. Set ENABLE_CHAOS_ENDPOINTS=true to enable.", endpoint = "/api/stress/cpu" }, statusCode: 403);
+    }
     var duration = Math.Min(seconds ?? 10, 30);
     logger.LogWarning("CPU stress test started for {Duration}s", duration);
     var sw = Stopwatch.StartNew();
@@ -184,6 +192,11 @@ app.MapGet("/api/stress/cpu", (int? seconds) =>
 
 app.MapGet("/api/stress/memory", (int? megabytes) =>
 {
+    if (!IsChaosEnabled())
+    {
+        logger.LogInformation("Memory stress test blocked: ENABLE_CHAOS_ENDPOINTS is not true");
+        return Results.Json(new { error = "Chaos endpoints are disabled. Set ENABLE_CHAOS_ENDPOINTS=true to enable.", endpoint = "/api/stress/memory" }, statusCode: 403);
+    }
     var mb = Math.Min(megabytes ?? 50, 200);
     logger.LogWarning("Memory pressure test: allocating {MB}MB", mb);
     var data = new byte[mb * 1024 * 1024];
@@ -193,6 +206,11 @@ app.MapGet("/api/stress/memory", (int? megabytes) =>
 
 app.MapGet("/api/simulate/incident", async (OrderDbContext db) =>
 {
+    if (!IsChaosEnabled())
+    {
+        logger.LogInformation("Incident simulation blocked: ENABLE_CHAOS_ENDPOINTS is not true");
+        return Results.Json(new { error = "Chaos endpoints are disabled. Set ENABLE_CHAOS_ENDPOINTS=true to enable.", endpoint = "/api/simulate/incident" }, statusCode: 403);
+    }
     logger.LogCritical("INCIDENT SIMULATION: generating error burst with DB pressure");
     var errors = new List<string>();
     for (int i = 0; i < 20; i++)

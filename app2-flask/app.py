@@ -410,7 +410,7 @@ def health():
 # ========== USER CONTEXT ==========
 @app.route('/api/whoami')
 def whoami():
-    """Show current user identity — useful for verifying user tracking."""
+    """Show current user identity \u2014 useful for verifying user tracking."""
     return jsonify({
         "user_id": session.get("user_id", "unknown"),
         "user_name": session.get("user_name", "unknown"),
