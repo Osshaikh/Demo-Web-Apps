@@ -3,16 +3,60 @@ import time
 import random
 import logging
 import uuid
+import json
 
 from flask import Flask, redirect, render_template, request, send_from_directory, url_for, jsonify, session
 from azure.monitor.opentelemetry import configure_azure_monitor
 from opentelemetry import trace, metrics
+import requests as http_requests
 
 # Configure Azure Monitor OpenTelemetry
 configure_azure_monitor()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ========== AZURE SERVICE CLIENTS (auto-traced by OpenTelemetry) ==========
+from azure.identity import DefaultAzureCredential, ManagedIdentityCredential
+from azure.storage.blob import BlobServiceClient
+from azure.keyvault.secrets import SecretClient
+
+_credential = None
+_blob_client = None
+_kv_client = None
+
+def get_credential():
+    global _credential
+    if not _credential:
+        try:
+            _credential = DefaultAzureCredential()
+        except Exception:
+            _credential = None
+    return _credential
+
+def get_blob_client():
+    global _blob_client
+    if not _blob_client:
+        storage_url = os.environ.get("AZURE_STORAGE_ACCOUNT_URL")
+        cred = get_credential()
+        if storage_url and cred:
+            try:
+                _blob_client = BlobServiceClient(storage_url, credential=cred)
+            except Exception as e:
+                logger.warning("Failed to init blob client: %s", e)
+    return _blob_client
+
+def get_kv_client():
+    global _kv_client
+    if not _kv_client:
+        kv_url = os.environ.get("AZURE_KEYVAULT_URL")
+        cred = get_credential()
+        if kv_url and cred:
+            try:
+                _kv_client = SecretClient(vault_url=kv_url, credential=cred)
+            except Exception as e:
+                logger.warning("Failed to init Key Vault client: %s", e)
+    return _kv_client
 
 # ========== SIMULATED USER POOL ==========
 # Demo personas to generate realistic multi-user telemetry
@@ -270,6 +314,17 @@ def product_stats():
 def purchase_product(product_id):
     start_time = time.time()
 
+    # CHAOS_MODE check — persistent failure that requires config fix to resolve
+    chaos_mode = os.environ.get("CHAOS_MODE", "").lower()
+    if chaos_mode == "persistent":
+        logger.error('Purchase blocked: CHAOS_MODE=persistent is enabled',
+                     extra={"custom_dimensions": {
+                         "product_id": product_id,
+                         "failure_reason": "chaos_mode_persistent",
+                         "resolution": "Remove CHAOS_MODE app setting to restore service"
+                     }})
+        return jsonify({"error": "Service degraded: purchase processing is disabled", "chaos_mode": True}), 503
+
     # 3. CUSTOM SPAN — wraps business logic in a named trace operation
     #    Shows up as a custom dependency/operation in App Insights "Transaction search"
     with tracer.start_as_current_span("process-purchase") as span:
@@ -293,8 +348,8 @@ def purchase_product(product_id):
         # 4. CUSTOM METRIC — count every purchase attempt with dimensional attributes
         purchase_counter.add(1, {"status": "attempted", "category": product.category})
 
-        roll = random.randint(1, 100)
-        if roll <= 2:  # 2% chance (was 20% with randint(1,10) <= 2)
+        roll = random.randint(1, 10)
+        if roll <= 2:
             span.set_attribute("purchase.result", "payment_timeout")
             span.set_status(trace.StatusCode.ERROR, "Payment gateway timeout")
             purchase_counter.add(1, {"status": "failed", "reason": "timeout", "category": product.category})
@@ -308,14 +363,9 @@ def purchase_product(product_id):
                              "failure_reason": "payment_gateway_timeout",
                              "transaction_value": round(product.price * qty, 2)
                          }})
-            return jsonify({
-                "error": "Payment gateway timeout \u2014 please retry",
-                "type": "PaymentTimeout",
-                "product_id": product_id,
-                "retry_after_seconds": 5
-            }), 504
+            raise TimeoutError(f"Payment gateway timeout for product {product_id}")
 
-        if roll == 3:  # 1% chance (was 10% with randint(1,10) == 3)
+        if roll == 3:
             span.set_attribute("purchase.result", "inventory_sync_error")
             span.set_status(trace.StatusCode.ERROR, "Inventory sync failed")
             purchase_counter.add(1, {"status": "failed", "reason": "sync_error", "category": product.category})
@@ -325,12 +375,7 @@ def purchase_product(product_id):
                              "product_id": product_id, "product_name": product.name,
                              "category": product.category, "failure_reason": "stale_cache"
                          }})
-            return jsonify({
-                "error": "Inventory sync temporarily unavailable \u2014 please retry",
-                "type": "InventorySyncError",
-                "product_id": product_id,
-                "retry_after_seconds": 2
-            }), 503
+            raise RuntimeError(f"Inventory sync failed — stale cache for product {product_id}")
 
         if product.stock < qty:
             span.set_attribute("purchase.result", "insufficient_stock")
@@ -383,6 +428,37 @@ def purchase_product(product_id):
         elapsed_ms = (time.time() - start_time) * 1000
         api_latency_histogram.record(elapsed_ms, {"endpoint": "purchase", "status": "success"})
 
+        # ========== DOWNSTREAM DEPENDENCY CALLS (auto-traced) ==========
+        # 9. AZURE BLOB STORAGE — upload purchase receipt
+        try:
+            blob_svc = get_blob_client()
+            if blob_svc:
+                receipt = json.dumps({
+                    "purchase_id": str(uuid.uuid4()),
+                    "product_id": product_id, "product_name": product.name,
+                    "quantity": qty, "revenue": revenue,
+                    "user_id": session.get("user_id", "unknown"),
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                })
+                blob_name = f"receipts/{time.strftime('%Y/%m/%d')}/{uuid.uuid4()}.json"
+                container = blob_svc.get_container_client("purchase-receipts")
+                container.upload_blob(name=blob_name, data=receipt, overwrite=True)
+                span.set_attribute("receipt.blob_path", blob_name)
+                logger.info("Receipt uploaded to blob: %s", blob_name)
+        except Exception as e:
+            logger.warning("Failed to upload receipt to blob: %s", str(e))
+
+        # 10. EXTERNAL HTTP API — fetch exchange rate
+        try:
+            ext_api_url = os.environ.get("EXTERNAL_API_URL", "https://open.er-api.com/v6/latest/USD")
+            ext_resp = http_requests.get(ext_api_url, timeout=5)
+            if ext_resp.status_code == 200:
+                rates = ext_resp.json().get("rates", {})
+                span.set_attribute("exchange_rate.EUR", rates.get("EUR", 0))
+                logger.info("Exchange rate fetched: EUR=%s", rates.get("EUR"))
+        except Exception as e:
+            logger.warning("Failed to fetch exchange rate: %s", str(e))
+
         logger.info('Purchase completed successfully',
                     extra={"custom_dimensions": {
                         "product_id": product_id, "product_name": product.name,
@@ -407,6 +483,54 @@ def health():
     return jsonify({"status": "healthy", "app": "sre-demo-flask", "database": db_status, "timestamp": time.time()})
 
 
+# ========== DEPENDENCY STATUS ==========
+@app.route('/api/dependencies/status')
+def dependency_status():
+    """Check all downstream dependencies — each call is auto-traced by OpenTelemetry."""
+    results = {}
+
+    # 1. Database
+    try:
+        Product.query.first()
+        results["postgresql"] = {"status": "connected", "target": "sre-demo-pg.postgres.database.azure.com"}
+    except Exception as e:
+        results["postgresql"] = {"status": "error", "error": str(e)}
+
+    # 2. Azure Blob Storage
+    try:
+        blob_svc = get_blob_client()
+        if blob_svc:
+            container = blob_svc.get_container_client("purchase-receipts")
+            props = container.get_container_properties()
+            results["blob_storage"] = {"status": "connected", "target": os.environ.get("AZURE_STORAGE_ACCOUNT_URL", ""), "container": "purchase-receipts"}
+        else:
+            results["blob_storage"] = {"status": "not_configured"}
+    except Exception as e:
+        results["blob_storage"] = {"status": "error", "error": str(e)}
+
+    # 3. Azure Key Vault
+    try:
+        kv = get_kv_client()
+        if kv:
+            secret = kv.get_secret("api-key")
+            results["key_vault"] = {"status": "connected", "target": os.environ.get("AZURE_KEYVAULT_URL", ""), "secret_retrieved": True}
+        else:
+            results["key_vault"] = {"status": "not_configured"}
+    except Exception as e:
+        results["key_vault"] = {"status": "error", "error": str(e)}
+
+    # 4. External HTTP API
+    try:
+        ext_url = os.environ.get("EXTERNAL_API_URL", "https://open.er-api.com/v6/latest/USD")
+        resp = http_requests.get(ext_url, timeout=5)
+        results["external_api"] = {"status": "connected" if resp.status_code == 200 else "error", "target": ext_url, "status_code": resp.status_code}
+    except Exception as e:
+        results["external_api"] = {"status": "error", "error": str(e)}
+
+    all_ok = all(d.get("status") in ("connected", "not_configured") for d in results.values())
+    return jsonify({"overall": "healthy" if all_ok else "degraded", "dependencies": results})
+
+
 # ========== USER CONTEXT ==========
 @app.route('/api/whoami')
 def whoami():
@@ -420,35 +544,10 @@ def whoami():
 
 
 # ========== SRE CHAOS ENDPOINTS ==========
-# Guard: set ENABLE_CHAOS_ENDPOINTS=true to allow chaos/stress testing.
-# Disabled by default to prevent accidental alert noise in production.
-CHAOS_ENABLED = os.environ.get("ENABLE_CHAOS_ENDPOINTS", "false").lower() == "true"
-_chaos_cooldown = {}  # simple per-endpoint cooldown tracker
-CHAOS_COOLDOWN_SECONDS = 60  # minimum seconds between chaos invocations
-
-
-def _check_chaos_allowed(endpoint_name):
-    """Return (allowed: bool, reason: str|None). Enforces feature flag + cooldown."""
-    if not CHAOS_ENABLED:
-        return False, "Chaos endpoints are disabled. Set ENABLE_CHAOS_ENDPOINTS=true to enable."
-    last_call = _chaos_cooldown.get(endpoint_name, 0)
-    elapsed = time.time() - last_call
-    if elapsed < CHAOS_COOLDOWN_SECONDS:
-        remaining = int(CHAOS_COOLDOWN_SECONDS - elapsed)
-        return False, f"Rate limited. Retry after {remaining}s."
-    _chaos_cooldown[endpoint_name] = time.time()
-    return True, None
-
-
 @app.route('/api/stress/cpu')
 def stress_cpu():
-    allowed, reason = _check_chaos_allowed("stress_cpu")
-    if not allowed:
-        logger.info('CPU stress test blocked: %s', reason)
-        return jsonify({"error": reason, "endpoint": "/api/stress/cpu"}), 403
-
     seconds = min(int(request.args.get('seconds', 10)), 30)
-    logger.warning('CPU stress test for %ds (chaos enabled)', seconds)
+    logger.warning('CPU stress test for %ds', seconds)
     end = time.time() + seconds
     while time.time() < end:
         _ = sum(i * i for i in range(1000))
@@ -457,11 +556,6 @@ def stress_cpu():
 
 @app.route('/api/simulate/incident')
 def simulate_incident():
-    allowed, reason = _check_chaos_allowed("simulate_incident")
-    if not allowed:
-        logger.info('Incident simulation blocked: %s', reason)
-        return jsonify({"error": reason, "endpoint": "/api/simulate/incident"}), 403
-
     logger.critical('INCIDENT SIMULATION: generating error burst with DB pressure')
     errors = []
     for i in range(20):
@@ -473,6 +567,59 @@ def simulate_incident():
             errors.append(str(e))
         time.sleep(0.1)
     return jsonify({"message": "Incident simulation complete", "error_count": len(errors)})
+
+
+# ========== PERSISTENT FAILURE SCENARIOS ==========
+# These require config changes to resolve — not transient
+
+_memory_hog = []  # holds allocated memory blocks
+
+@app.route('/api/chaos/memory', methods=['POST'])
+def chaos_memory_pressure():
+    """Allocate memory that won't be freed — causes OOM over time.
+    Resolution: restart the app or call DELETE /api/chaos/memory"""
+    mb = int(request.args.get('mb', 50))
+    mb = min(mb, 200)  # cap at 200MB per call
+    _memory_hog.append(bytearray(mb * 1024 * 1024))
+    total_mb = sum(len(b) for b in _memory_hog) // (1024 * 1024)
+    logger.critical('MEMORY PRESSURE: allocated %dMB, total held: %dMB',
+                    mb, total_mb,
+                    extra={"custom_dimensions": {
+                        "failure_reason": "memory_pressure",
+                        "allocated_mb": mb,
+                        "total_held_mb": total_mb,
+                        "resolution": "Restart app service or call DELETE /api/chaos/memory"
+                    }})
+    return jsonify({"message": f"Allocated {mb}MB", "total_held_mb": total_mb}), 200
+
+
+@app.route('/api/chaos/memory', methods=['DELETE'])
+def chaos_memory_release():
+    """Release all held memory."""
+    released = sum(len(b) for b in _memory_hog) // (1024 * 1024)
+    _memory_hog.clear()
+    logger.info('Memory released: %dMB freed', released)
+    return jsonify({"message": f"Released {released}MB"})
+
+
+@app.route('/api/chaos/status')
+def chaos_status():
+    """Check current chaos state."""
+    chaos_mode = os.environ.get("CHAOS_MODE", "disabled")
+    memory_held = sum(len(b) for b in _memory_hog) // (1024 * 1024)
+    return jsonify({
+        "chaos_mode": chaos_mode,
+        "memory_held_mb": memory_held,
+        "db_healthy": _check_db(),
+    })
+
+
+def _check_db():
+    try:
+        Product.query.first()
+        return True
+    except:
+        return False
 
 
 @app.errorhandler(Exception)

@@ -1,12 +1,31 @@
 using System.Diagnostics;
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Azure.Monitor.OpenTelemetry.AspNetCore;
+using Azure.Storage.Blobs;
+using Azure.Security.KeyVault.Secrets;
+using Azure.Core;
 
 var builder = WebApplication.CreateBuilder(args);
 
 // Azure Monitor OpenTelemetry — sends traces, metrics, logs to Application Insights
 builder.Services.AddOpenTelemetry().UseAzureMonitor();
 builder.Services.AddHttpClient();
+
+// Azure service clients (auto-traced by OpenTelemetry)
+// Registered as optional — app still works if Azure services unavailable
+TokenCredential credential = new Azure.Identity.ManagedIdentityCredential();
+var storageUrl = builder.Configuration["AZURE_STORAGE_ACCOUNT_URL"];
+var kvUrl = builder.Configuration["AZURE_KEYVAULT_URL"];
+
+try
+{
+    if (!string.IsNullOrEmpty(storageUrl))
+        builder.Services.AddSingleton(new BlobServiceClient(new Uri(storageUrl), credential));
+    if (!string.IsNullOrEmpty(kvUrl))
+        builder.Services.AddSingleton(new SecretClient(new Uri(kvUrl), credential));
+}
+catch { /* Azure clients will be null if init fails — handled gracefully in endpoints */ }
 
 // Entity Framework Core with SQL Server
 var connStr = builder.Configuration.GetConnectionString("SqlDb")
@@ -42,6 +61,57 @@ app.UseStaticFiles();
 app.MapGet("/", () => Results.File("index.html", "text/html"));
 app.MapGet("/api/health", () => Results.Ok(new { status = "healthy", app = "sre-demo-dotnet", service = "Order Management API", timestamp = DateTime.UtcNow }));
 app.MapGet("/health", () => Results.Ok(new { status = "healthy" }));
+
+// ========== DEPENDENCY STATUS (each call is auto-traced) ==========
+app.MapGet("/api/dependencies/status", async (OrderDbContext db) =>
+{
+    var results = new Dictionary<string, object>();
+
+    // 1. SQL Server
+    try { await db.Orders.FirstOrDefaultAsync(); results["sql_server"] = new { status = "connected", target = "sre-demo-sql.database.windows.net" }; }
+    catch (Exception ex) { results["sql_server"] = new { status = "error", error = ex.Message }; }
+
+    // 2. Blob Storage
+    try
+    {
+        var blobSvc = app.Services.GetService<BlobServiceClient>();
+        if (blobSvc != null)
+        {
+            var container = blobSvc.GetBlobContainerClient("order-confirmations");
+            await container.GetPropertiesAsync();
+            results["blob_storage"] = new { status = "connected", target = app.Configuration["AZURE_STORAGE_ACCOUNT_URL"] ?? "" };
+        }
+        else results["blob_storage"] = new { status = "not_configured" };
+    }
+    catch (Exception ex) { results["blob_storage"] = new { status = "error", error = ex.Message }; }
+
+    // 3. Key Vault
+    try
+    {
+        var kvClient = app.Services.GetService<SecretClient>();
+        if (kvClient != null)
+        {
+            await kvClient.GetSecretAsync("api-key");
+            results["key_vault"] = new { status = "connected", target = app.Configuration["AZURE_KEYVAULT_URL"] ?? "" };
+        }
+        else results["key_vault"] = new { status = "not_configured" };
+    }
+    catch (Exception ex) { results["key_vault"] = new { status = "error", error = ex.Message }; }
+
+    // 4. External HTTP API
+    try
+    {
+        var httpFactory = app.Services.GetRequiredService<IHttpClientFactory>();
+        var client = httpFactory.CreateClient();
+        var extUrl = app.Configuration["EXTERNAL_API_URL"] ?? "https://open.er-api.com/v6/latest/USD";
+        var resp = await client.GetAsync(extUrl);
+        results["external_api"] = new { status = resp.IsSuccessStatusCode ? "connected" : "error", target = extUrl, statusCode = (int)resp.StatusCode };
+    }
+    catch (Exception ex) { results["external_api"] = new { status = "error", error = ex.Message }; }
+
+    var allOk = results.Values.All(v => v.GetType().GetProperty("status")?.GetValue(v)?.ToString() is "connected" or "not_configured");
+    return Results.Ok(new { overall = allOk ? "healthy" : "degraded", dependencies = results });
+});
 
 // ========== CRUD: LIST ORDERS ==========
 app.MapGet("/api/orders", async (OrderDbContext db) =>
@@ -152,6 +222,33 @@ app.MapPost("/api/orders/{id}/pay", async (int id, OrderDbContext db) =>
     order.Status = "Paid";
     await db.SaveChangesAsync();
     logger.LogInformation("Payment completed for order {OrderId}, amount {Amount}", id, order.Amount);
+
+    // DOWNSTREAM: Upload order confirmation to Blob Storage (auto-traced)
+    try
+    {
+        var blobSvc = app.Services.GetService<BlobServiceClient>();
+        if (blobSvc != null)
+        {
+            var container = blobSvc.GetBlobContainerClient("order-confirmations");
+            var confirmation = JsonSerializer.Serialize(new { orderId = id, amount = order.Amount, customer = order.CustomerName, paidAt = DateTime.UtcNow });
+            var blobName = $"confirmations/{DateTime.UtcNow:yyyy/MM/dd}/{Guid.NewGuid()}.json";
+            await container.UploadBlobAsync(blobName, new BinaryData(confirmation));
+            logger.LogInformation("Order confirmation uploaded to blob: {BlobName}", blobName);
+        }
+    }
+    catch (Exception ex) { logger.LogWarning(ex, "Failed to upload order confirmation to blob"); }
+
+    // DOWNSTREAM: Call external notification API (auto-traced)
+    try
+    {
+        var httpFactory = app.Services.GetRequiredService<IHttpClientFactory>();
+        var client = httpFactory.CreateClient();
+        var extUrl = app.Configuration["EXTERNAL_API_URL"] ?? "https://open.er-api.com/v6/latest/USD";
+        var extResp = await client.GetAsync(extUrl);
+        logger.LogInformation("External API called: status={StatusCode}", (int)extResp.StatusCode);
+    }
+    catch (Exception ex) { logger.LogWarning(ex, "Failed to call external API"); }
+
     return Results.Ok(new { message = "Payment successful", orderId = id, amount = order.Amount });
 });
 
@@ -173,16 +270,8 @@ app.MapGet("/api/external", async (IHttpClientFactory httpFactory) =>
 });
 
 // ========== SRE CHAOS ENDPOINTS ==========
-bool IsChaosEnabled() =>
-    string.Equals(Environment.GetEnvironmentVariable("ENABLE_CHAOS_ENDPOINTS"), "true", StringComparison.OrdinalIgnoreCase);
-
 app.MapGet("/api/stress/cpu", (int? seconds) =>
 {
-    if (!IsChaosEnabled())
-    {
-        logger.LogInformation("CPU stress test blocked: ENABLE_CHAOS_ENDPOINTS is not true");
-        return Results.Json(new { error = "Chaos endpoints are disabled. Set ENABLE_CHAOS_ENDPOINTS=true to enable.", endpoint = "/api/stress/cpu" }, statusCode: 403);
-    }
     var duration = Math.Min(seconds ?? 10, 30);
     logger.LogWarning("CPU stress test started for {Duration}s", duration);
     var sw = Stopwatch.StartNew();
@@ -192,11 +281,6 @@ app.MapGet("/api/stress/cpu", (int? seconds) =>
 
 app.MapGet("/api/stress/memory", (int? megabytes) =>
 {
-    if (!IsChaosEnabled())
-    {
-        logger.LogInformation("Memory stress test blocked: ENABLE_CHAOS_ENDPOINTS is not true");
-        return Results.Json(new { error = "Chaos endpoints are disabled. Set ENABLE_CHAOS_ENDPOINTS=true to enable.", endpoint = "/api/stress/memory" }, statusCode: 403);
-    }
     var mb = Math.Min(megabytes ?? 50, 200);
     logger.LogWarning("Memory pressure test: allocating {MB}MB", mb);
     var data = new byte[mb * 1024 * 1024];
@@ -206,11 +290,6 @@ app.MapGet("/api/stress/memory", (int? megabytes) =>
 
 app.MapGet("/api/simulate/incident", async (OrderDbContext db) =>
 {
-    if (!IsChaosEnabled())
-    {
-        logger.LogInformation("Incident simulation blocked: ENABLE_CHAOS_ENDPOINTS is not true");
-        return Results.Json(new { error = "Chaos endpoints are disabled. Set ENABLE_CHAOS_ENDPOINTS=true to enable.", endpoint = "/api/simulate/incident" }, statusCode: 403);
-    }
     logger.LogCritical("INCIDENT SIMULATION: generating error burst with DB pressure");
     var errors = new List<string>();
     for (int i = 0; i < 20; i++)

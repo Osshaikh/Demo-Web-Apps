@@ -5,3 +5,7 @@ opentelemetry-instrumentation-flask
 opentelemetry-api
 flask-sqlalchemy
 psycopg2-binary
+azure-identity
+azure-storage-blob
+azure-keyvault-secrets
+requests
