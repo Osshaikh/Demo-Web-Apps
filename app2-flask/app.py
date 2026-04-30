@@ -279,6 +279,73 @@ def delete_product(product_id):
     return jsonify({"message": "Deleted", "product_id": product_id})
 
 
+# ========== CURRENCY CONVERSION (live external API call) ==========
+@app.route('/api/products/<int:product_id>/price')
+def get_product_price(product_id):
+    """Get product price converted to any currency using live exchange rates.
+    Query params: currency (default: USD), quantity (default: 1)
+    Each call hits the external exchange rate API — auto-traced as HTTP dependency."""
+    product = db.session.get(Product, product_id)
+    if not product:
+        return jsonify({"error": "Product not found"}), 404
+
+    currency = request.args.get('currency', 'USD').upper()
+    qty = int(request.args.get('quantity', 1))
+    base_total = round(product.price * qty, 2)
+
+    if currency == 'USD':
+        return jsonify({
+            "product": product.name, "quantity": qty,
+            "currency": "USD", "unit_price": product.price,
+            "total": base_total, "exchange_rate": 1.0
+        })
+
+    # Call external exchange rate API (auto-traced by OpenTelemetry)
+    ext_api_url = os.environ.get("EXTERNAL_API_URL", "https://open.er-api.com/v6/latest/USD")
+    try:
+        resp = http_requests.get(ext_api_url, timeout=5)
+        resp.raise_for_status()
+        rates = resp.json().get("rates", {})
+        rate = rates.get(currency)
+        if not rate:
+            return jsonify({"error": f"Currency '{currency}' not supported", "available": sorted(rates.keys())}), 400
+
+        converted_price = round(product.price * rate, 2)
+        converted_total = round(base_total * rate, 2)
+        logger.info("Currency conversion: %s x%d = %.2f USD -> %.2f %s (rate: %.4f)",
+                     product.name, qty, base_total, converted_total, currency, rate,
+                     extra={"custom_dimensions": {
+                         "product_id": product_id, "product_name": product.name,
+                         "currency": currency, "exchange_rate": rate,
+                         "usd_amount": base_total, "converted_amount": converted_total
+                     }})
+        return jsonify({
+            "product": product.name, "quantity": qty,
+            "currency": currency, "unit_price_usd": product.price,
+            "unit_price_converted": converted_price,
+            "total_usd": base_total, "total_converted": converted_total,
+            "exchange_rate": rate
+        })
+    except http_requests.Timeout:
+        logger.error("Exchange rate API timeout for currency %s", currency)
+        return jsonify({"error": "Exchange rate service timeout", "currency": currency}), 504
+    except Exception as e:
+        logger.error("Exchange rate API error: %s", str(e))
+        return jsonify({"error": f"Exchange rate service error: {str(e)}"}), 502
+
+
+@app.route('/api/currencies')
+def list_currencies():
+    """List all available currencies from the exchange rate API."""
+    ext_api_url = os.environ.get("EXTERNAL_API_URL", "https://open.er-api.com/v6/latest/USD")
+    try:
+        resp = http_requests.get(ext_api_url, timeout=5)
+        rates = resp.json().get("rates", {})
+        return jsonify({"base": "USD", "currencies": sorted(rates.keys()), "count": len(rates)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+
 # ========== SEARCH / AGGREGATE ==========
 @app.route('/api/products/search')
 def search_products():
