@@ -415,7 +415,7 @@ def purchase_product(product_id):
         # 4. CUSTOM METRIC — count every purchase attempt with dimensional attributes
         purchase_counter.add(1, {"status": "attempted", "category": product.category})
 
-        roll = random.randint(1, 10)
+        roll = random.randint(1, 100)
         if roll <= 2:
             span.set_attribute("purchase.result", "payment_timeout")
             span.set_status(trace.StatusCode.ERROR, "Payment gateway timeout")
@@ -430,7 +430,7 @@ def purchase_product(product_id):
                              "failure_reason": "payment_gateway_timeout",
                              "transaction_value": round(product.price * qty, 2)
                          }})
-            raise TimeoutError(f"Payment gateway timeout for product {product_id}")
+            return jsonify({"error": "Payment gateway timeout", "product_id": product_id}), 504
 
         if roll == 3:
             span.set_attribute("purchase.result", "inventory_sync_error")
@@ -442,7 +442,7 @@ def purchase_product(product_id):
                              "product_id": product_id, "product_name": product.name,
                              "category": product.category, "failure_reason": "stale_cache"
                          }})
-            raise RuntimeError(f"Inventory sync failed — stale cache for product {product_id}")
+            return jsonify({"error": "Inventory sync failed", "product_id": product_id}), 503
 
         if product.stock < qty:
             span.set_attribute("purchase.result", "insufficient_stock")
@@ -610,9 +610,15 @@ def whoami():
     })
 
 
-# ========== SRE CHAOS ENDPOINTS ==========
+# ========== SRE CHAOS ENDPOINTS (gated behind ENABLE_CHAOS_ENDPOINTS) ==========
+def _check_chaos_allowed():
+    """Return True if chaos endpoints are enabled via env var."""
+    return os.environ.get('ENABLE_CHAOS_ENDPOINTS', '').lower() == 'true'
+
 @app.route('/api/stress/cpu')
 def stress_cpu():
+    if not _check_chaos_allowed():
+        return jsonify({"error": "Chaos endpoints are disabled. Set ENABLE_CHAOS_ENDPOINTS=true to enable."}), 403
     seconds = min(int(request.args.get('seconds', 10)), 30)
     logger.warning('CPU stress test for %ds', seconds)
     end = time.time() + seconds
@@ -623,6 +629,8 @@ def stress_cpu():
 
 @app.route('/api/simulate/incident')
 def simulate_incident():
+    if not _check_chaos_allowed():
+        return jsonify({"error": "Chaos endpoints are disabled. Set ENABLE_CHAOS_ENDPOINTS=true to enable."}), 403
     logger.critical('INCIDENT SIMULATION: generating error burst with DB pressure')
     errors = []
     for i in range(20):
@@ -645,6 +653,8 @@ _memory_hog = []  # holds allocated memory blocks
 def chaos_memory_pressure():
     """Allocate memory that won't be freed — causes OOM over time.
     Resolution: restart the app or call DELETE /api/chaos/memory"""
+    if not _check_chaos_allowed():
+        return jsonify({"error": "Chaos endpoints are disabled. Set ENABLE_CHAOS_ENDPOINTS=true to enable."}), 403
     mb = int(request.args.get('mb', 50))
     mb = min(mb, 200)  # cap at 200MB per call
     _memory_hog.append(bytearray(mb * 1024 * 1024))
