@@ -137,6 +137,14 @@ app.MapGet("/api/orders/{id}", async (int id, OrderDbContext db) =>
 // ========== CRUD: CREATE ORDER ==========
 app.MapPost("/api/orders", async (CreateOrderRequest req, OrderDbContext db) =>
 {
+    // Validate required fields to prevent NULL insertion into SQL
+    if (string.IsNullOrWhiteSpace(req.CustomerName))
+        return Results.BadRequest(new { error = "CustomerName is required" });
+    if (string.IsNullOrWhiteSpace(req.Product))
+        return Results.BadRequest(new { error = "Product is required" });
+    if (req.Amount <= 0)
+        return Results.BadRequest(new { error = "Amount must be greater than zero" });
+
     logger.LogInformation("Creating order for customer {Customer}, product {Product}", req.CustomerName, req.Product);
     var order = new Order
     {
@@ -207,16 +215,16 @@ app.MapPost("/api/orders/{id}/pay", async (int id, OrderDbContext db) =>
     var order = await db.Orders.FindAsync(id);
     if (order is null) return Results.NotFound(new { error = "Order not found" });
 
-    var roll = Random.Shared.Next(1, 10);
-    if (roll <= 3)
+    var roll = Random.Shared.Next(1, 100);
+    if (roll <= 2)
     {
         logger.LogError("Payment gateway timeout for order {OrderId}", id);
-        throw new TimeoutException($"Payment gateway timeout processing order {id}");
+        return Results.Json(new { error = "Payment gateway timeout", orderId = id }, statusCode: 504);
     }
-    if (roll == 4)
+    if (roll == 3)
     {
         logger.LogError("Payment declined for order {OrderId}: insufficient funds", id);
-        throw new InvalidOperationException($"Payment declined for order {id}: insufficient funds");
+        return Results.Json(new { error = "Payment declined: insufficient funds", orderId = id }, statusCode: 402);
     }
 
     order.Status = "Paid";
@@ -269,9 +277,13 @@ app.MapGet("/api/external", async (IHttpClientFactory httpFactory) =>
     }
 });
 
-// ========== SRE CHAOS ENDPOINTS ==========
+// ========== SRE CHAOS ENDPOINTS (gated behind ENABLE_CHAOS_ENDPOINTS) ==========
+bool IsChaosEnabled() => string.Equals(app.Configuration["ENABLE_CHAOS_ENDPOINTS"], "true", StringComparison.OrdinalIgnoreCase);
+
 app.MapGet("/api/stress/cpu", (int? seconds) =>
 {
+    if (!IsChaosEnabled())
+        return Results.Json(new { error = "Chaos endpoints are disabled. Set ENABLE_CHAOS_ENDPOINTS=true to enable." }, statusCode: 403);
     var duration = Math.Min(seconds ?? 10, 30);
     logger.LogWarning("CPU stress test started for {Duration}s", duration);
     var sw = Stopwatch.StartNew();
@@ -281,6 +293,8 @@ app.MapGet("/api/stress/cpu", (int? seconds) =>
 
 app.MapGet("/api/stress/memory", (int? megabytes) =>
 {
+    if (!IsChaosEnabled())
+        return Results.Json(new { error = "Chaos endpoints are disabled. Set ENABLE_CHAOS_ENDPOINTS=true to enable." }, statusCode: 403);
     var mb = Math.Min(megabytes ?? 50, 200);
     logger.LogWarning("Memory pressure test: allocating {MB}MB", mb);
     var data = new byte[mb * 1024 * 1024];
@@ -290,13 +304,14 @@ app.MapGet("/api/stress/memory", (int? megabytes) =>
 
 app.MapGet("/api/simulate/incident", async (OrderDbContext db) =>
 {
+    if (!IsChaosEnabled())
+        return Results.Json(new { error = "Chaos endpoints are disabled. Set ENABLE_CHAOS_ENDPOINTS=true to enable." }, statusCode: 403);
     logger.LogCritical("INCIDENT SIMULATION: generating error burst with DB pressure");
     var errors = new List<string>();
     for (int i = 0; i < 20; i++)
     {
         try
         {
-            // Hammer the DB with bad queries to generate dependency failures
             await db.Orders.Where(o => o.CustomerName == $"nonexistent-{Guid.NewGuid()}").CountAsync();
             throw new Exception($"Cascading failure #{i}: connection pool exhausted");
         }
